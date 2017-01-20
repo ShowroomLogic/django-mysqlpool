@@ -17,7 +17,7 @@ from django.db.backends.mysql import base
 from django.core.exceptions import ImproperlyConfigured
 
 try:
-    import sqlalchemy.pool as pool
+    import sqlalchemy
 except ImportError as e:
     raise ImproperlyConfigured("Error loading SQLAlchemy module: %s" % e)
 
@@ -30,6 +30,34 @@ DEFAULT_BACKEND = 'QueuePool'
 # Needs to be less than MySQL connection timeout (server setting). The default
 # is 120, so default to 119.
 DEFAULT_POOL_TIMEOUT = 119
+
+
+class QueuePool(sqlalchemy.pool.QueuePool):
+
+    def _do_get(self):
+        use_overflow = self._max_overflow > -1
+
+        try:
+            wait = use_overflow and self._overflow >= self._max_overflow
+            return self._pool.get(wait, self._timeout)
+        except sqlalchemy.pool.sqla_queue.Empty:
+            if use_overflow and self._overflow >= self._max_overflow:
+                if not wait:
+                    return self._do_get()
+                else:
+                    raise sqlalchemy.exc.TimeoutError(
+                        "QueuePool limit of size %d overflow %d reached, "
+                        "connection timed out, timeout %d" %
+                        (self.size(), self.overflow(), self._timeout))
+
+            if self._inc_overflow():
+                try:
+                    return self._create_connection()
+                except:
+                    with sqlalchemy.util.safe_reraise():
+                        self._dec_overflow()
+            else:
+                return self._do_get()
 
 
 def isiterable(value):
