@@ -1,23 +1,12 @@
-# -*- coding: utf-8 -*-
-"""The top-level package for ``django-mysqlpool``."""
-# These imports make 2 act like 3, making it easier on us to switch to PyPy or
-# some other VM if we need to for performance reasons.
-from __future__ import (absolute_import, print_function, unicode_literals,
-                        division)
-
-# Make ``Foo()`` work the same in Python 2 as it does in Python 3.
-__metaclass__ = type
-
-
 import os
-
+import logging
 
 from django.conf import settings
 from django.db.backends.mysql import base
 from django.core.exceptions import ImproperlyConfigured
 
 try:
-    import sqlalchemy
+    from sqlalchemy import pool, util, exc
 except ImportError as e:
     raise ImproperlyConfigured("Error loading SQLAlchemy module: %s" % e)
 
@@ -31,30 +20,55 @@ DEFAULT_BACKEND = 'QueuePool'
 # is 120, so default to 119.
 DEFAULT_POOL_TIMEOUT = 119
 
+logger = logging.getLogger('django.db.backends')
 
-class QueuePool(sqlalchemy.pool.QueuePool):
+
+class QueuePool(pool.QueuePool):
+
+    def __init__(self, *args, **kwargs):
+        super(QueuePool, self).__init__(*args, **kwargs)
+        logger.info(
+            "Creating connection pool with size {}, overflow {}, and timeout {}".format(
+                self.size(), self._max_overflow, self._timeout
+            )
+        )
 
     def _do_get(self):
+
         use_overflow = self._max_overflow > -1
 
         try:
             wait = use_overflow and self._overflow >= self._max_overflow
             return self._pool.get(wait, self._timeout)
-        except sqlalchemy.pool.sqla_queue.Empty:
+        except pool.sqla_queue.Empty:
             if use_overflow and self._overflow >= self._max_overflow:
+                logger.warning((
+                    "Database connection pool full. size: {}, "
+                    "overflow: {} of {}"
+                ).format(self.size(), self.overflow(), self._max_overflow))
                 if not wait:
                     return self._do_get()
                 else:
-                    raise sqlalchemy.exc.TimeoutError(
+                    logger.error((
+                        "Unable to establish database connection. Timeout {}"
+                    ).format(self._timeout))
+                    raise exc.TimeoutError(
                         "QueuePool limit of size %d overflow %d reached, "
                         "connection timed out, timeout %d" %
                         (self.size(), self.overflow(), self._timeout))
 
             if self._inc_overflow():
+                
+                if self._overflow >= 0:
+                    logger.warning((
+                        "Database connection pool full. size: {}, "
+                        "overflow: {} of {}"
+                    ).format(self.size(), self.overflow(), self._max_overflow))
+                
                 try:
                     return self._create_connection()
                 except:
-                    with sqlalchemy.util.safe_reraise():
+                    with util.safe_reraise():
                         self._dec_overflow()
             else:
                 return self._do_get()
@@ -116,11 +130,11 @@ def get_pool():
     """Create one and only one pool using the configured settings."""
     global MYSQLPOOL
     if MYSQLPOOL is None:
-        backend_name = getattr(settings, 'MYSQLPOOL_BACKEND', DEFAULT_BACKEND)
-        backend = getattr(pool, backend_name)
+        backend = QueuePool
         kwargs = getattr(settings, 'MYSQLPOOL_ARGUMENTS', {})
         kwargs.setdefault('poolclass', backend)
         kwargs.setdefault('recycle', DEFAULT_POOL_TIMEOUT)
+        kwargs['echo'] = False
         MYSQLPOOL = pool.manage(OldDatabase, **kwargs)
         setattr(MYSQLPOOL, '_pid', os.getpid())
 
